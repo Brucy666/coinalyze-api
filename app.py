@@ -1,6 +1,6 @@
 import os, json, time, glob
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 import numpy as np
 
 APP_NAME = "Coinalyze API"
-VERSION  = "1.1.0"
+VERSION  = "1.1.1"
 
 # Local dir inside API container (no Railway volume required)
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
@@ -20,7 +20,6 @@ RING_MAX = int(os.getenv("RING_MAX", "500"))
 _ring: List[Dict[str, Any]] = []
 
 app = FastAPI(title=APP_NAME, version=VERSION)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,6 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------- ring / files ----------------------------
 def _list_snapshot_files():
     return sorted(glob.glob(str(DATA_DIR / "*.json")), key=os.path.getmtime, reverse=True)
 
@@ -39,25 +39,63 @@ def _push_ring(payload: Dict[str, Any]):
 def _latest_from_ring():
     return _ring[0] if _ring else None
 
-def _try_get_timeseries(payload):
-    prices = None
-    volumes = None
-    if isinstance(payload, dict):
-        if isinstance(payload.get("prices"), list):
-            prices = payload.get("prices")
-            volumes = payload.get("volumes")
-        elif isinstance(payload.get("ohlc"), dict):
-            o = payload["ohlc"]
-            prices = o.get("close") or o.get("c") or o.get("price")
-            volumes = o.get("volume") or o.get("v")
-        if prices is None:
-            for _, v in payload.items():
-                if isinstance(v, list) and all(isinstance(x, (int, float)) for x in v):
-                    if prices is None: prices = v
-                    elif volumes is None: volumes = v
-                    if prices is not None and volumes is not None: break
-    return prices, volumes
+# ---------------------------- helpers ----------------------------
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None: return None
+        if isinstance(x, (int, float)): return float(x)
+        s = str(x).replace(",", "").strip().lower()
+        if s in ("", "none", "null", "nan"): return None
+        return float(s)
+    except Exception:
+        return None
 
+def _extract_closes_vols(ohlcv_list):
+    """Return (closes, volumes) from history.ohlcv list of bars."""
+    closes, vols = [], []
+    if not isinstance(ohlcv_list, list): return closes, vols
+    for b in ohlcv_list:
+        if not isinstance(b, dict): continue
+        c = _to_float(b.get("c") or b.get("close") or b.get("price") or b.get("C"))
+        v = _to_float(b.get("v") or b.get("volume") or b.get("V"))
+        if c is not None:
+            closes.append(c)
+            vols.append(v if v is not None else 0.0)
+    return closes, vols
+
+def _compute_vwap(closes, vols, lookback=120):
+    if not closes or not vols: return None
+    p = closes[-lookback:] if len(closes) >= lookback else closes
+    v = vols[-lookback:] if len(vols) >= lookback else vols
+    denom = float(np.sum(v))
+    return float(np.sum(np.array(p, float) * np.array(v, float)) / denom) if denom else None
+
+def _compute_rsi14(closes):
+    c = np.asarray(closes, dtype=float)
+    d = np.diff(c)
+    if d.size < 14: return None
+    up = np.where(d > 0, d, 0.0); dn = np.where(d < 0, -d, 0.0)
+    au = up[:14].mean(); ad = dn[:14].mean() or 1e-6
+    rs = au / ad; rsi = 100 - 100 / (1 + rs)
+    for i in range(14, d.size):
+        au = (au * 13 + max(d[i], 0)) / 14
+        ad = (ad * 13 + max(-d[i], 0)) / 14 or 1e-6
+        rs = au / ad; rsi = 100 - 100 / (1 + rs)
+    return float(rsi)
+
+def _extract_cvd_delta(cvd_hist):
+    """From history.cvd list; supports dict items with 'cvd'/'value' keys."""
+    if not isinstance(cvd_hist, list) or not cvd_hist: return None, None
+    def _cvd_of(x):
+        if isinstance(x, dict):
+            return _to_float(x.get("cvd") or x.get("value") or x.get("v"))
+        return _to_float(x)
+    last = _cvd_of(cvd_hist[-1])
+    prev = _cvd_of(cvd_hist[-2]) if len(cvd_hist) >= 2 else None
+    dlt  = (last - prev) if (last is not None and prev is not None) else None
+    return last, dlt
+
+# ---------------------------- routes ----------------------------
 @app.get("/")
 def root():
     return {"status": "online", "name": APP_NAME, "version": VERSION}
@@ -122,6 +160,14 @@ async def ingest(request: Request, x_auth_token: str = Header(default="")):
 
 @app.get("/v1/metrics/summary")
 def metrics_summary():
+    """
+    Build a compact, null-safe summary from the collector pack:
+    - price from history.ohlcv last close
+    - vwap over last N candles (if volume is available)
+    - rsi(14) from closes (if not provided)
+    - cvd & delta from history.cvd list
+    - (optional) oi / funding / long_short_ratio / liq when present
+    """
     latest = _latest_from_ring()
     if latest is None:
         files = _list_snapshot_files()
@@ -130,44 +176,74 @@ def metrics_summary():
         with open(files[0], "r") as f:
             latest = json.load(f)
 
-    prices, volumes = _try_get_timeseries(latest)
-    price_now = latest.get("price") or latest.get("last") or (prices[-1] if prices else None)
-    vol_now   = latest.get("volume") or (volumes[-1] if volumes else None)
-    cvd       = latest.get("cvd") or latest.get("CVD") or latest.get("cum_v") or 0
-    delta     = latest.get("delta") or 0
+    # If the collector already flattened values, keep using them.
+    flat_price = _to_float(latest.get("price"))
+    flat_vwap  = _to_float(latest.get("vwap"))
+    flat_rsi   = _to_float(latest.get("rsi"))
+    flat_cvd   = _to_float(latest.get("cvd"))
+    flat_delta = _to_float(latest.get("delta"))
+    flat_vol   = _to_float(latest.get("volume"))
 
-    vwap = None
-    if prices and volumes and len(prices) == len(volumes) and len(prices) > 0:
-        p = np.asarray(prices, dtype=float)
-        v = np.asarray(volumes, dtype=float)
-        denom = v.sum()
-        vwap = float((p * v).sum() / (denom if denom != 0 else 1.0))
+    # Prefer structured extraction when flat fields are null/empty
+    hist  = latest.get("history", {}) if isinstance(latest, dict) else {}
+    snaps = latest.get("snapshots", {}) if isinstance(latest, dict) else {}
 
-    rsi = None
-    if prices and len(prices) >= 15:
-        arr = np.asarray(prices, dtype=float)
-        deltas = np.diff(arr)
-        seed = deltas[:14]
-        up = seed[seed >= 0].sum() / 14
-        down = -seed[seed < 0].sum() / 14
-        rs = up / (down if down != 0 else 1e-6)
-        rsi_val = 100 - 100 / (1 + rs)
-        for i in range(14, len(arr) - 1):
-            d = deltas[i]
-            up = (up * 13 + max(d, 0)) / 14
-            down = (down * 13 + -min(d, 0)) / 14
-            rs = up / (down if down != 0 else 1e-6)
-            rsi_val = 100 - 100 / (1 + rs)
-        rsi = float(rsi_val)
-    if rsi is None and price_now is not None:
-        rsi = float(max(0, min(100, 50 + ((float(price_now) % 10) - 5) * 2)))
+    closes, vols = _extract_closes_vols(hist.get("ohlcv"))
+    price = flat_price if flat_price is not None else (closes[-1] if closes else None)
+    vwap  = flat_vwap  if flat_vwap  is not None else (_compute_vwap(closes, vols, lookback=120) if (closes and vols) else None)
 
-    return JSONResponse(content={
-        "timestamp": latest.get("timestamp"),
-        "price": float(price_now) if price_now is not None else None,
-        "volume": float(vol_now) if vol_now is not None else None,
-        "vwap": round(vwap, 8) if vwap is not None else None,
-        "rsi": round(rsi, 4) if rsi is not None else None,
-        "cvd": float(cvd) if cvd is not None else 0.0,
-        "delta": float(delta) if delta is not None else 0.0,
-    })
+    rsi = flat_rsi
+    if rsi is None and closes and len(closes) >= 15:
+        rsi = _compute_rsi14(closes)
+
+    cvd, delta = flat_cvd, flat_delta
+    if cvd is None or delta is None:
+        cvd_hist = hist.get("cvd")
+        c, d = _extract_cvd_delta(cvd_hist)
+        if cvd is None:   cvd = c
+        if delta is None: delta = d
+
+    vol_now = flat_vol if flat_vol is not None else (vols[-1] if vols else None)
+
+    # Optional extras (exposed if the collector wrote them)
+    oi = _to_float(snaps.get("oi_value") or snaps.get("open_interest") or latest.get("oi"))
+    funding_rate = _to_float(snaps.get("fr_value") or snaps.get("funding_rate") or latest.get("funding_rate"))
+    long_short_ratio = None
+    lsr_hist = hist.get("long_short_ratio")
+    if isinstance(lsr_hist, list) and lsr_hist:
+        last_lsr = lsr_hist[-1]
+        long_short_ratio = _to_float(last_lsr.get("ratio") if isinstance(last_lsr, dict) else last_lsr)
+    if long_short_ratio is None:
+        long_short_ratio = _to_float(snaps.get("long_short_ratio") or latest.get("long_short_ratio"))
+
+    liq = None
+    liq_hist = hist.get("liquidations")
+    if isinstance(liq_hist, list) and liq_hist:
+        # Sum last 50 bars if numeric, else report count
+        vals = []
+        for e in liq_hist[-50:]:
+            v = None
+            if isinstance(e, dict):
+                v = _to_float(e.get("qty") or e.get("amount") or e.get("value"))
+            else:
+                v = _to_float(e)
+            if v is not None:
+                vals.append(v)
+        liq = float(sum(vals)) if vals else float(len(liq_hist[-50:]))
+
+    payload = {
+        "timestamp": latest.get("fetched_at") or latest.get("timestamp"),
+        "price": price,
+        "volume": vol_now,
+        "vwap": vwap,
+        "rsi": rsi,
+        "cvd": cvd if cvd is not None else 0.0,
+        "delta": delta if delta is not None else 0.0,
+        # extras if present
+        "oi": oi,
+        "funding_rate": funding_rate,
+        "long_short_ratio": long_short_ratio,
+        "liquidations": liq,
+        "source_file": latest.get("source_file") or None
+    }
+    return JSONResponse(content=payload)
