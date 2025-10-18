@@ -1,74 +1,243 @@
-# integrations/coinalyze_api.py
-import os
-import time
-import requests
+import os, json, time, glob
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
-BASE_URL = (os.getenv("COINALYZER_API_BASE") or "https://api.coinalyze.net").rstrip("/")
-API_KEY = os.getenv("COINALYZER_API_KEY", "")
-TIMEOUT = float(os.getenv("COINALYZER_TIMEOUT", "10"))
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
-if API_KEY:
-    HEADERS["Authorization"] = f"Bearer {API_KEY}"
-    HEADERS["X-API-KEY"] = API_KEY
+from fastapi import FastAPI, HTTPException, Query, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import numpy as np
 
-# Normalize timeframes (1min → 1m, 1hour → 1h)
-_INTERVAL_MAP = {
-    "1min": "1m", "3min": "3m", "5min": "5m", "15min": "15m",
-    "30min": "30m", "1hour": "1h", "4hour": "4h", "12hour": "12h", "1day": "1d"
-}
-def _norm_tf(tf): return _INTERVAL_MAP.get(tf.lower().strip(), tf)
+APP_NAME = "Coinalyze API"
+VERSION  = "1.1.1"
 
-# ---------- HTTP core ----------
-def _get(url, params):
-    """Try ?symbol= first, then fallback to ?symbols= for backward compat."""
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+INGEST_TOKEN = os.getenv("INGEST_TOKEN", "changeme")
+RING_MAX = int(os.getenv("RING_MAX", "500"))
+_ring: List[Dict[str, Any]] = []
+
+app = FastAPI(title=APP_NAME, version=VERSION)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+# ---------- file helpers ----------
+def _list_snapshot_files() -> List[str]:
+    return sorted(glob.glob(str(DATA_DIR / "*.json")), key=os.path.getmtime, reverse=True)
+
+def _push_ring(payload: Dict[str, Any]):
+    _ring.insert(0, payload)
+    if len(_ring) > RING_MAX:
+        _ring.pop()
+
+def _latest_from_ring() -> Optional[Dict[str, Any]]:
+    return _ring[0] if _ring else None
+
+def _to_float(x):
     try:
-        r = requests.get(url, params={**params, "symbol": params.get("symbol", params.get("symbols"))},
-                         headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code >= 400:
-            raise requests.HTTPError(f"Bad request ({r.status_code})", response=r)
-        return r.json()
-    except requests.HTTPError as e:
-        # fallback attempt
-        status = getattr(e.response, "status_code", None)
-        if status and 400 <= status < 500:
-            r2 = requests.get(url, params={**params, "symbols": params.get("symbol", params.get("symbols"))},
-                              headers=HEADERS, timeout=TIMEOUT)
-            r2.raise_for_status()
-            return r2.json()
-        raise
+        if x is None: return None
+        if isinstance(x, (int, float)): return float(x)
+        s = str(x).replace(",","").strip().lower()
+        if s in ("", "none", "null", "nan"): return None
+        return float(s)
+    except Exception:
+        return None
 
-# ---------- API Endpoints ----------
-def get_exchanges(): return _get(f"{BASE_URL}/v1/exchanges", {})
+def _extract_closes_vols(ohlcv_list):
+    closes, vols = [], []
+    if not isinstance(ohlcv_list, list):
+        return closes, vols
+    for b in ohlcv_list:
+        if not isinstance(b, dict): continue
+        c = _to_float(b.get("c") or b.get("close") or b.get("price") or b.get("C"))
+        v = _to_float(b.get("v") or b.get("volume") or b.get("V"))
+        if c is not None:
+            closes.append(c)
+            vols.append(v if v is not None else 0.0)
+    return closes, vols
 
-def get_future_markets(): return _get(f"{BASE_URL}/v1/futures-markets", {})
+def _compute_vwap(closes, vols, lookback=120):
+    if not closes or not vols: return None
+    p = closes[-lookback:] if len(closes) >= lookback else closes
+    v = vols[-lookback:] if len(vols) >= lookback else vols
+    denom = float(np.sum(v))
+    return float(np.sum(np.array(p, float) * np.array(v, float)) / denom) if denom else None
 
-def get_open_interest(symbol): return _get(f"{BASE_URL}/v1/open-interest", {"symbol": symbol})
+def _compute_rsi14(closes):
+    c = np.asarray(closes, dtype=float)
+    d = np.diff(c)
+    if d.size < 14: return None
+    up = np.where(d>0, d, 0.0)
+    dn = np.where(d<0, -d, 0.0)
+    au = up[:14].mean()
+    ad = dn[:14].mean() or 1e-6
+    rs = au/ad
+    rsi = 100 - 100/(1+rs)
+    for i in range(14, d.size):
+        au = (au*13 + max(d[i],0))/14
+        ad = (ad*13 + max(-d[i],0))/14 or 1e-6
+        rs = au/ad
+        rsi = 100 - 100/(1+rs)
+    return float(rsi)
 
-def get_funding_rate(symbol): return _get(f"{BASE_URL}/v1/funding-rate", {"symbol": symbol})
+def _extract_cvd_delta(cvd_hist):
+    if not isinstance(cvd_hist, list) or not cvd_hist: return None, None
+    def _cvd_of(x):
+        if isinstance(x, dict):
+            return _to_float(x.get("cvd") or x.get("value") or x.get("v"))
+        return _to_float(x)
+    last = _cvd_of(cvd_hist[-1])
+    prev = _cvd_of(cvd_hist[-2]) if len(cvd_hist) >= 2 else None
+    dlt  = (last - prev) if (last is not None and prev is not None) else None
+    return last, dlt
 
-def get_open_interest_history(symbol, interval, t0, t1):
-    return _get(f"{BASE_URL}/v1/open-interest-history",
-                {"symbol": symbol, "interval": _norm_tf(interval), "from": int(t0), "to": int(t1)})
+# ---------- routes ----------
+@app.get("/")
+def root():
+    return {"status": "online", "name": APP_NAME, "version": VERSION}
 
-def get_funding_rate_history(symbol, interval, t0, t1):
-    return _get(f"{BASE_URL}/v1/funding-rate-history",
-                {"symbol": symbol, "interval": _norm_tf(interval), "from": int(t0), "to": int(t1)})
+@app.get("/health")
+def health():
+    files = _list_snapshot_files()
+    return {
+        "status": "ok",
+        "data_dir": str(DATA_DIR),
+        "file_count": len(files),
+        "latest_file": os.path.basename(files[0]) if files else None,
+        "ring_items": len(_ring),
+    }
 
-def get_predicted_funding_rate_history(symbol, interval, t0, t1):
-    return _get(f"{BASE_URL}/v1/predicted-funding-rate-history",
-                {"symbol": symbol, "interval": _norm_tf(interval), "from": int(t0), "to": int(t1)})
+@app.get("/v1/metrics/latest")
+def get_latest():
+    latest = _latest_from_ring()
+    if latest is not None:
+        return latest
+    files = _list_snapshot_files()
+    if not files:
+        raise HTTPException(status_code=404, detail="No metrics found")
+    with open(files[0], "r") as f:
+        return json.load(f)
 
-def get_liquidation_history(symbol, interval, t0, t1):
-    return _get(f"{BASE_URL}/v1/liquidation-history",
-                {"symbol": symbol, "interval": _norm_tf(interval), "from": int(t0), "to": int(t1)})
+@app.get("/v1/metrics/all")
+def get_all(limit: int = Query(50, ge=1, le=1000)):
+    out = list(_ring[:limit])
+    remaining = max(0, limit - len(out))
+    if remaining:
+        files = _list_snapshot_files()
+        for fp in files[:remaining]:
+            try:
+                with open(fp, "r") as f:
+                    out.append(json.load(f))
+            except Exception:
+                continue
+    if not out:
+        raise HTTPException(status_code=404, detail="No metrics found")
+    return JSONResponse(content={"count": len(out), "metrics": out})
 
-def get_long_short_ratio_history(symbol, interval, t0, t1):
-    return _get(f"{BASE_URL}/v1/long-short-ratio-history",
-                {"symbol": symbol, "interval": _norm_tf(interval), "from": int(t0), "to": int(t1)})
+@app.post("/v1/ingest")
+async def ingest(request: Request, x_auth_token: str = Header(default="")):
+    if x_auth_token not in (INGEST_TOKEN, f"Bearer {INGEST_TOKEN}"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Payload must be a JSON object")
+        ts = int(payload.get("timestamp") or time.time())
+        payload["timestamp"] = ts
+        fpath = DATA_DIR / f"{ts}.json"
+        with open(fpath, "w") as f:
+            json.dump(payload, f, separators=(",", ":"), ensure_ascii=False)
+        _push_ring(payload)
+        return {"status": "ok", "stored": True, "file": fpath.name}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-def get_ohlcv_history(symbol, interval, t0, t1):
-    return _get(f"{BASE_URL}/v1/ohlcv-history",
-                {"symbol": symbol, "interval": _norm_tf(interval), "from": int(t0), "to": int(t1)})
+@app.get("/v1/metrics/summary")
+def metrics_summary(symbol: str | None = Query(default=None)):
+    """
+    Builds a compact summary from the newest pack (optionally the newest pack for `symbol`).
+    Reads only local snapshots; no external requests.
+    """
+    latest = _latest_from_ring()
+
+    if latest is None:
+        files = _list_snapshot_files()
+        if not files:
+            raise HTTPException(status_code=404, detail="No metrics files found")
+
+        # If symbol is specified, pick the first file in reverse order matching it
+        if symbol:
+            symu = symbol.upper()
+            for fp in files:
+                try:
+                    with open(fp, "r") as f:
+                        pack = json.load(f)
+                    if (pack.get("symbol") or "").upper().endswith(symu) or (pack.get("symbol") or "").upper() == symu:
+                        latest = pack
+                        break
+                except Exception:
+                    continue
+        if latest is None:
+            with open(files[0], "r") as f:
+                latest = json.load(f)
+
+    hist  = latest.get("history", {}) if isinstance(latest, dict) else {}
+    snaps = latest.get("snapshots", {}) if isinstance(latest, dict) else {}
+
+    closes, vols = _extract_closes_vols(hist.get("ohlcv"))
+    price = _to_float(latest.get("price")) or (closes[-1] if closes else None)
+    vwap  = _to_float(latest.get("vwap"))  or (_compute_vwap(closes, vols, lookback=120) if (closes and vols) else None)
+    rsi   = _to_float(latest.get("rsi"))
+    if rsi is None and closes and len(closes) >= 15:
+        rsi = _compute_rsi14(closes)
+
+    cvd, delta = _to_float(latest.get("cvd")), _to_float(latest.get("delta"))
+    if cvd is None or delta is None:
+        c, d = _extract_cvd_delta(hist.get("cvd"))
+        if cvd is None:   cvd = c
+        if delta is None: delta = d
+
+    vol_now = _to_float(latest.get("volume")) or (vols[-1] if vols else None)
+
+    oi = _to_float(snaps.get("oi_value") or snaps.get("open_interest") or latest.get("oi"))
+    funding_rate = _to_float(snaps.get("fr_value") or snaps.get("funding_rate") or latest.get("funding_rate"))
+
+    # optional extras
+    lsr_hist = hist.get("long_short_ratio")
+    long_short_ratio = None
+    if isinstance(lsr_hist, list) and lsr_hist:
+        last = lsr_hist[-1]
+        long_short_ratio = _to_float(last.get("ratio") if isinstance(last, dict) else last)
+    if long_short_ratio is None:
+        long_short_ratio = _to_float(snaps.get("long_short_ratio") or latest.get("long_short_ratio"))
+
+    liq_hist = hist.get("liquidations")
+    liq = None
+    if isinstance(liq_hist, list) and liq_hist:
+        vals = []
+        for e in liq_hist[-50:]:
+            v = None
+            if isinstance(e, dict):
+                v = _to_float(e.get("qty") or e.get("amount") or e.get("value"))
+            else:
+                v = _to_float(e)
+            if v is not None:
+                vals.append(v)
+        liq = float(sum(vals)) if vals else float(len(liq_hist[-50:]))
+
+    payload = {
+        "timestamp": latest.get("fetched_at") or latest.get("timestamp"),
+        "symbol": latest.get("symbol"),
+        "price": price,
+        "volume": vol_now,
+        "vwap": vwap,
+        "rsi": rsi,
+        "cvd": cvd if cvd is not None else 0.0,
+        "delta": delta if delta is not None else 0.0,
+        "oi": oi,
+        "funding_rate": funding_rate,
+        "long_short_ratio": long_short_ratio,
+        "liquidations": liq,
+    }
+    return JSONResponse(content=payload)
